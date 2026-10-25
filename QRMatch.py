@@ -27,7 +27,7 @@ from collections import Counter
 from copy import deepcopy
 
 # SAB
-from OTSU import OTSU_threshold
+from aia import AIASelector
 from SuperAugmentation import Super_Augmentation
 from grad_conflict import GradConflictLogger, encoder_parameters, gradient_cosine, should_measure
 
@@ -134,6 +134,22 @@ def main():
                         help='warmup epochs (unlabeled data based)')
     parser.add_argument('--aia-warmup-epochs', default=100, type=int,
                         help='epochs to wait before enabling AIA re-augmentation')
+    parser.add_argument('--aia-alpha', default=0.5, type=float,
+                        help='EMA smoothing factor alpha of the AIA sample-loss history (Eq. 13)')
+    parser.add_argument('--aia-noise-std', default=1.0, type=float,
+                        help='std of the Gaussian noise in AIA re-augmentation')
+    parser.add_argument('--aia-mask-prob', default=0.1, type=float,
+                        help='pixel mask ratio in AIA re-augmentation')
+    parser.add_argument('--aia-off', action='store_true',
+                        help='disable AIA completely (the statistics are still recorded)')
+    parser.add_argument('--aia-only', default='all', choices=['all', 'correct', 'incorrect'],
+                        help='oracle: re-augment only the simple samples whose pseudo-label is '
+                             'correct / incorrect (ground-truth labels are used; analysis only)')
+    parser.add_argument('--aia-zero', default='none', choices=['none', 'correct', 'incorrect'],
+                        help='oracle: set the consistency loss of the simple samples whose '
+                             'pseudo-label is correct / incorrect to 0 (analysis only)')
+    parser.add_argument('--aia-track', default=8, type=int,
+                        help='number of random samples whose loss trajectory is recorded')
     parser.add_argument('--wdecay', default=5e-4, type=float,
                         help='weight decay')
     parser.add_argument('--nesterov', action='store_true', default=True,
@@ -416,7 +432,7 @@ def ce_loss(logits, targets, use_hard_labels=True, reduction='none'):
     
 
 def consistency_loss(logits_s, logits_w, class_acc, p_target, p_model, index_u, history_dict, name='ce',
-                     T=1.0, p_cutoff=0.0, use_hard_labels=True, use_DA=False):
+                     T=1.0, p_cutoff=0.0, use_hard_labels=True, use_DA=False, sample_weight=None):
     assert name in ['ce', 'L2']
     logits_w = logits_w.detach()
     if name == 'L2':
@@ -461,6 +477,8 @@ def consistency_loss(logits_s, logits_w, class_acc, p_target, p_model, index_u, 
         else:
             pseudo_label = torch.softmax(logits_w / T, dim=-1)
             masked_loss = ce_loss(logits_s, pseudo_label, use_hard_labels) * mask
+        if sample_weight is not None:  # analysis only: zero the loss of chosen samples
+            masked_loss = masked_loss * sample_weight
         return masked_loss.mean(), mask.mean(), select, max_idx.long(), p_model
 
     else:
@@ -478,8 +496,12 @@ def train(args, labeled_trainloader, unlabeled_trainloader, val_loader,
         grad_logger = GradConflictLogger(args.out, tag=args.grad_cos_tag)
         grad_params = encoder_parameters(model)
     test_accs = []
-    OTSU_dict = {}
     history_dict = {}
+    # AIA selector (paper Sec. III-D): EMA of sample losses, class-wise Otsu thresholds.
+    # Labels are used only to log statistics / run the oracle analysis, never for training.
+    aia = AIASelector(len(unlabeled_dataset), args.num_classes, unlabeled_dataset.label,
+                      alpha=args.aia_alpha, out_dir=args.out, track_n=args.aia_track,
+                      seed=args.seed)
     end = time.time()
 
     # Flexmatch
@@ -548,21 +570,25 @@ def train(args, labeled_trainloader, unlabeled_trainloader, val_loader,
                 if value not in history_dict:
                     history_dict[value] = []
 
-            # AIA warm-up: collect sample-loss history first, then enable re-augmentation.
-            # epoch is zero-based, so default=100 disables AIA for epochs 0-99
-            # and enables it starting from the 101st training epoch.
-            if epoch >= args.aia_warmup_epochs:
-                for value in index_u:
-                    if history_dict[value]:
-                        OTSU_dict[value] = OTSU_threshold(history_dict[value])
-                for idx, value in enumerate(index_u):
-                    if (
-                        history_dict[value]
-                        and value in OTSU_dict
-                        and history_dict[value][-1] < OTSU_dict[value]
-                    ):
-                        inputs_u_s2[idx] = Super_Augmentation(inputs_u_s2[idx].clone().detach())
-
+            # AIA: simple samples = EMA loss below the class-wise Otsu threshold (Eq. 16).
+            # The EMA / threshold state is the one before this iteration. epoch is zero-based,
+            # so default=100 disables re-augmentation for epochs 0-99.
+            zero_w = None
+            simple = aia.is_simple(index_u)
+            right = aia.correct(index_u)
+            if epoch >= args.aia_warmup_epochs and not args.aia_off:
+                chosen = simple.copy()
+                if args.aia_only == 'correct':
+                    chosen &= right
+                elif args.aia_only == 'incorrect':
+                    chosen &= ~right
+                for idx in np.nonzero(chosen)[0]:
+                    inputs_u_s2[idx] = Super_Augmentation(
+                        inputs_u_s2[idx], mask_prob=args.aia_mask_prob,
+                        noise_std=args.aia_noise_std).to(inputs_u_s2.dtype)
+                if args.aia_zero != 'none':
+                    drop = simple & (right if args.aia_zero == 'correct' else ~right)
+                    zero_w = torch.from_numpy((~drop).astype(np.float32))
 
             # Flexmatch的相关代码
             pseudo_counter = Counter(selected_label.tolist())
@@ -603,7 +629,13 @@ def train(args, labeled_trainloader, unlabeled_trainloader, val_loader,
                                                                     history_dict,
                                                                     'ce', T, p_cutoff,
                                                                     use_hard_labels=args.hard_label,
-                                                                    use_DA=args.use_DA)
+                                                                    use_DA=args.use_DA,
+                                                                    sample_weight=None if zero_w is None
+                                                                    else zero_w.to(logits_u_s.device))
+            # update the AIA state with this iteration's per-sample consistency loss
+            with torch.no_grad():
+                cur_loss = F.cross_entropy(logits_u_s.detach(), pseudo_lb, reduction='none')
+            aia.update(index_u, cur_loss.cpu().numpy(), pseudo_lb.cpu().numpy())
             select = select.to(x_ulb_idx.device)
             x_ulb_idx = x_ulb_idx.to(select.device)
             if x_ulb_idx[select == 1].nelement() != 0:
@@ -749,6 +781,10 @@ def train(args, labeled_trainloader, unlabeled_trainloader, val_loader,
             args.writer.add_scalar('train/5.mask', mask_probs.avg, epoch)
             args.writer.add_scalar('test/1.test_acc', val_acc, epoch)
             args.writer.add_scalar('test/2.test_loss', val_loss, epoch)
+            aia_row = aia.end_epoch(epoch)
+            args.writer.add_scalar('aia/1.n_simple', aia_row['n_simple'], epoch)
+            args.writer.add_scalar('aia/2.simple_precision', aia_row['simple_precision'], epoch)
+            args.writer.add_scalar('aia/3.pl_acc_seen', aia_row['pl_acc_seen'], epoch)
             if grad_logger is not None:
                 cos_mean = grad_logger.end_epoch(epoch + 1)
                 if cos_mean is not None:
